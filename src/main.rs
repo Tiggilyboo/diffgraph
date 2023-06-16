@@ -1,4 +1,4 @@
-use std::process::Command;
+use std::{process::Command, io::Write};
 use url::Url;
 use std::path::Path;
 use regex::Regex;
@@ -74,6 +74,85 @@ fn try_get_diff_patch(diff_args: &str) -> Result<String, String> {
     }
 }
 
+fn try_validate_diff_patch(patch: &str) -> Result<(), String> {
+    let mut cmd_gitapply = Command::new("git")
+        .args(&["apply", "--numstat", "--summary", "--check", "-"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("Failed to validate git diff, are you sure the diff can apply to this repository?");
+
+    if let Some(stdin) = cmd_gitapply.stdin.as_mut() {
+        stdin.write_all(patch.as_bytes())
+            .expect("Failed to write patch to stdin");
+    }
+
+    let output = cmd_gitapply.wait_with_output()
+        .expect("Failed to read git apply command");
+
+    let err_str = String::from_utf8_lossy(&output.stderr).to_string();
+    if err_str.len() > 0 {
+        return Err(err_str);
+    }
+
+    let out_str = String::from_utf8_lossy(&output.stdout).to_string();
+    if out_str.len() > 0 {
+        println!("Validated patch: {}", out_str);
+        Ok(())
+    }
+    else {
+        Err("error: Unexpected response from git apply to validate diff".into())
+    }
+}
+
+fn try_load_diff_file(file_path: &str) -> Result<String, String> {
+    let path = Path::new(file_path);
+    match std::fs::read_to_string(path) {
+        Ok(file_contents) => Ok(file_contents),
+        Err(err) => Err(err.to_string()),
+    }
+}
+
+fn try_parse_diff(diff_arg: &str) -> Result<Option<String>, String> {
+    let diff = match ArgValue::try_parse_commit(&diff_arg) {
+        Some(ArgValue::Commit { .. }) => match try_get_diff_patch(diff_arg) {
+            Ok(patch) => Ok(Some(patch)),
+            Err(err) => Err(format!("{}", err.to_string())),
+        },
+        _ => Ok(None),
+    };
+    if let Ok(Some(diff)) = diff {
+        return Ok(Some(diff))
+    }
+    let diff = match ArgValue::try_parse_file(&diff_arg) {
+        Some(ArgValue::Path { path, is_dir, exists }) => {
+            if exists {
+                if is_dir {
+                    Err(format!("diff path must be a file, directory is not supported at the moment..."))
+                } else {
+                    match try_load_diff_file(&path) {
+                        Ok(diff) => Ok(Some(diff)),
+                        Err(err) => Err(err.to_string()) 
+                    }
+                }
+            } else {
+                Err(format!("diff path '{}' does not exist.", path))
+            }
+        },
+        _ => Ok(None),
+    };
+
+    if let Ok(Some(diff)) = diff {
+        match try_validate_diff_patch(&diff) {
+            Ok(()) => Ok(Some(diff)),
+            Err(e) => Err(e),
+        }
+    } else {
+        Ok(None)
+    }
+}
+
 fn main() {
     let matches = clap::Command::new("diffdiagram")
         .arg(clap::arg!(--repository <VALUE>).required(true))
@@ -94,23 +173,11 @@ fn main() {
             _ => help(),
         }
     }
-    if let Some(arg) = matches.get_one::<String>("diff") {
-        match ArgValue::try_parse_commit(&arg) {
-            Some(ArgValue::Commit { .. }) => match try_get_diff_patch(arg) {
-                Ok(patch) => {
-                    println!("Diffing: {}", patch);
-                },
-                Err(err) => panic!("{}", err),
-            },
-            _ => (),
-        }
-        match ArgValue::try_parse_file(&arg) {
-            Some(ArgValue::Path { path, is_dir, exists }) => {
-
-            },
-            _ => help(),
-        }
-    }
-
-
+    
+    let diff_arg = matches.get_one::<String>("diff").unwrap();
+    let diff = try_parse_diff(diff_arg);
+    match diff {
+        Ok(diff) => println!("{:?}", diff),
+        Err(err) => println!("{}", err),
+    };
 }

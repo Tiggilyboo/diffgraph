@@ -3,6 +3,7 @@ use clap::Arg;
 use url::Url;
 use std::path::Path;
 use regex::Regex;
+use unidiff::PatchSet;
 
 use crate::graph::DiffGraphParams;
 
@@ -66,35 +67,11 @@ fn try_get_diff_patch(rev_from: &str, rev_to: &str) -> Result<String, String> {
     }
 }
 
-fn try_validate_diff_patch(patch: &str) -> Result<(), String> {
-    let mut cmd_gitapply = Command::new("git")
-        .args(&["apply", "--numstat", "--summary", "--check", "-"])
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .expect("Failed to validate git diff, are you sure the diff can apply to this repository?");
-
-    if let Some(stdin) = cmd_gitapply.stdin.as_mut() {
-        stdin.write_all(patch.as_bytes())
-            .expect("Failed to write patch to stdin");
-    }
-
-    let output = cmd_gitapply.wait_with_output()
-        .expect("Failed to read git apply command");
-
-    let err_str = String::from_utf8_lossy(&output.stderr).to_string();
-    if err_str.len() > 0 {
-        return Err(err_str);
-    }
-
-    let out_str = String::from_utf8_lossy(&output.stdout).to_string();
-    if out_str.len() > 0 {
-        println!("Validated patch: {}", out_str);
-        Ok(())
-    }
-    else {
-        Err("error: Unexpected response from git apply to validate diff".into())
+fn try_create_patch_set(diff: &str) -> Result<PatchSet, String> {
+    let mut patch = PatchSet::new();
+    match patch.parse(diff) {
+        Ok(_) => Ok(patch),
+        Err(e) => Err(e.to_string()),
     }
 }
 
@@ -106,38 +83,43 @@ fn try_load_diff_file(file_path: &str) -> Result<String, String> {
     }
 }
 
-fn try_parse_diff(diff_arg: &str) -> Result<Option<String>, String> {
-    let diff = match ArgValue::try_parse_commit(&diff_arg) {
+fn try_parse_diff(diff_arg: &str) -> Result<Option<PatchSet>, String> {
+    let mut diff = match ArgValue::try_parse_commit(&diff_arg) {
         Some(ArgValue::Commit { from, to }) => match try_get_diff_patch(&from, &to) {
             Ok(patch) => Ok(Some(patch)),
             Err(err) => Err(format!("{}", err.to_string())),
         },
         _ => Ok(None),
     };
-    if let Ok(Some(diff)) = diff {
-        return Ok(Some(diff))
+    let mut has_diff = false;
+    match diff {
+        Ok(Some(_)) => has_diff = true,
+        Ok(None) => has_diff = false,
+        Err(e) => return Err(e.to_string()),
     }
-    let diff = match ArgValue::try_parse_file(&diff_arg) {
-        Some(ArgValue::Path { path, is_dir, exists }) => {
-            if exists {
-                if is_dir {
-                    Err(format!("diff path must be a file, directory is not supported at the moment..."))
-                } else {
-                    match try_load_diff_file(&path) {
-                        Ok(diff) => Ok(Some(diff)),
-                        Err(err) => Err(err.to_string()) 
+    if !has_diff {
+        diff = match ArgValue::try_parse_file(&diff_arg) {
+            Some(ArgValue::Path { path, is_dir, exists }) => {
+                if exists {
+                    if is_dir {
+                        Err(format!("diff path must be a file, directory is not supported at the moment..."))
+                    } else {
+                        match try_load_diff_file(&path) {
+                            Ok(diff) => Ok(Some(diff)),
+                            Err(err) => Err(err.to_string()) 
+                        }
                     }
+                } else {
+                    Err(format!("diff path '{}' does not exist.", path))
                 }
-            } else {
-                Err(format!("diff path '{}' does not exist.", path))
-            }
-        },
-        _ => Ok(None),
-    };
+            },
+            _ => Ok(None),
+        };
+    }
 
     if let Ok(Some(diff)) = diff {
-        match try_validate_diff_patch(&diff) {
-            Ok(()) => Ok(Some(diff)),
+        match try_create_patch_set(&diff) {
+            Ok(patch) => Ok(Some(patch)),
             Err(e) => Err(e),
         }
     } else {

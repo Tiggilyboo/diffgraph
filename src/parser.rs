@@ -1,8 +1,8 @@
 use std::path::Path;
-use std::collections::HashMap;
-
 use unidiff::{PatchSet, PatchedFile, LINE_TYPE_ADDED, LINE_TYPE_REMOVED };
-use tree_sitter::{Point, InputEdit};
+use tree_sitter::{Parser, Tree, Point, InputEdit, Language};
+
+use crate::grammars::Grammars;
 
 #[derive(Debug)]
 struct LineByteCounter<'a> {
@@ -36,11 +36,12 @@ pub struct Diff {
     pub source: String,
     pub source_file: String,
     pub target_file: String,
+    pub source_file_path: String,
     pub added: Vec<InputEdit>,
     pub removed: Vec<InputEdit>,
 }
 
-fn try_load_file_from(patch_file_path: &str) -> Result<String, String> {
+fn get_fs_file_path<'a>(patch_file_path: &'a str) -> &'a str {
     let file = if let Some(stripped_path) = patch_file_path.strip_prefix("a/") {
         stripped_path
     } else if let Some(stripped_path) = patch_file_path.strip_prefix("b/") {
@@ -48,12 +49,21 @@ fn try_load_file_from(patch_file_path: &str) -> Result<String, String> {
     } else {
         patch_file_path
     };
-    let path = Path::new(file);
+
+    file
+}
+
+fn get_file_language(file_path: &str) -> Option<Language> {
+    None
+}
+
+fn try_load_file_from(file_path: &str) -> Result<String, String> {
+    let path = Path::new(file_path);
     if !path.exists() {
-        return Err(format!("'{}' does not exist", file));
+        return Err(format!("'{}' does not exist", file_path));
     }
     if !path.is_file() {
-        return Err(format!("'{}' is not a file", file))
+        return Err(format!("'{}' is not a file", file_path))
     }
     match std::fs::read_to_string(path) {
         Ok(contents) => Ok(contents),
@@ -70,7 +80,8 @@ impl Diff {
         let source: String;
 
         // Trim off the a/ or b/ from the file
-        match try_load_file_from(&patch_file.source_file) {
+        let source_file_path = get_fs_file_path(&patch_file.source_file);
+        match try_load_file_from(source_file_path) {
             Ok(contents) => source = contents,
             Err(e) => return Err(e),
         }
@@ -156,10 +167,12 @@ impl Diff {
     
         let source_file = patch_file.source_file.clone();
         let target_file = patch_file.target_file.clone();
+        let source_file_path = source_file_path.to_string();
 
         Ok(Self {
             source,
             source_file,
+            source_file_path,
             target_file,
             added,
             removed
@@ -167,15 +180,38 @@ impl Diff {
     }
 }
 
-pub fn try_parse_patch(patch: &PatchSet) -> Result<Vec<Diff>, String> {
-    let mut diffs = Vec::new();
+pub fn try_parse_source_code(language: Language, source_code: &str) -> Result<Option<Tree>, String> {
+    let mut parser = Parser::new();
+    parser.set_language(language).map_err(|e| e.to_string())?;
+
+    let timeout_micros = 1_000_000;
+    parser.set_timeout_micros(timeout_micros);
+
+    let tree = parser.parse(source_code, None);
+
+    Ok(tree)
+}
+
+pub fn try_parse_patch(patch: &PatchSet) -> Result<Vec<Tree>, String> {
+    let grammars = Grammars::load(Vec::new()).map_err(|e| e.to_string())?;
+    let mut trees = Vec::new();
 
     for patch_file in patch.files() {
         match Diff::from_patch_file(patch_file) {
-            Ok(diff) => diffs.push(diff),
+            Ok(diff) => {
+                let source_file_path = Path::new(&diff.source_file_path);
+                if let Some(lang) = grammars.try_get_language(source_file_path).map_err(|e| e.to_string())? {
+                    dbg!(lang);
+                    match try_parse_source_code(lang, &diff.source) {
+                        Ok(Some(tree)) => trees.push(tree),
+                        Ok(None) => return Err(format!("Unable to parse patch file: {}", patch_file.path())),
+                        Err(e) => return Err(e),
+                    }
+                }
+            },
             Err(e) => return Err(e),
         }
     }
 
-    Ok(diffs)
+    Ok(trees)
 }

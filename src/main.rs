@@ -1,6 +1,7 @@
 mod cli;
 mod graph;
 mod parser;
+mod grammars;
 
 use graph::*;
 

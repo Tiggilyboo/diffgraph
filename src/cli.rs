@@ -1,5 +1,5 @@
 use std::{process::Command, io::Write};
-use clap::Arg;
+use clap::{Arg, ArgAction};
 use url::Url;
 use std::path::Path;
 use regex::Regex;
@@ -225,17 +225,26 @@ pub fn get_params() -> Result<DiffGraphParams, String> {
             .long("repository")
             .value_name("URL or PATH")
             .default_value(".")
-            .required(true))
+            .required(true)
+            .help("Specify a URL or path to repository to diff against"))
         .arg(Arg::new("clone")
             .requires("repo")
             .short('c')
             .long("clone-path")
-            .value_name("PATH"))
+            .value_name("PATH")
+            .help("Specify a clone path for the diff repository to clone to"))
         .arg(Arg::new("diff")
             .short('d')
             .long("diff")
             .value_name("PATCH FILE or GIT REVISIONS")
-            .required(true))
+            .required(true)
+            .help("Specify diff patch file or git revision to create a diff"))
+        .arg(Arg::new("install-missing")
+            .short('i')
+            .long("install-missing")
+            .action(ArgAction::SetTrue)
+            .help("Install missing tree-sitter parsers automatically"))
+            
         .get_matches();
 
     let clone_path = matches.get_one::<String>("clone");
@@ -260,11 +269,15 @@ pub fn get_params() -> Result<DiffGraphParams, String> {
         }
     };
 
+    let install_lang_if_missing = matches.get_flag("install-missing");
+
     if let Some(diff) = diff {
         if let Some(repo) = repo {
             Ok(DiffGraphParams { 
-                repository_dir: repo, 
+                diff_repository_dir: repo, 
                 diff, 
+                install_lang_if_missing,
+                save_default_if_missing: true,
             })
         } else {
             Err("No repo given".into())

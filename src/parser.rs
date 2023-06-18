@@ -1,23 +1,41 @@
-use std::path::Path;
-use unidiff::{PatchSet, PatchedFile, LINE_TYPE_ADDED, LINE_TYPE_REMOVED };
-use tree_sitter::{Parser, Tree, Point, InputEdit, Language};
+use std::path::{Path, PathBuf};
+use unidiff::{PatchSet, PatchedFile, LINE_TYPE_ADDED, LINE_TYPE_REMOVED, LINE_TYPE_CONTEXT };
+use tree_sitter::{Parser, Tree, Point, InputEdit, Language, TreeCursor, Node};
 
 use crate::grammars::Grammars;
 
 #[derive(Debug)]
 struct LineByteCounter<'a> {
-    lines: std::str::Lines<'a>,
     byte_count: usize,
+    lines: std::str::Lines<'a>,
+    cache: Vec<(usize, &'a str)>,
 }
 
+// TODO: Use iterator (was impl but wasn't solid)
 impl<'a> LineByteCounter<'a> {
     fn new(content: &'a str) -> LineByteCounter<'a> {
+        let lines = content.lines();
+
         LineByteCounter { 
-            lines: content.lines(), 
-            byte_count: 0 
+            lines, 
+            byte_count: 0,
+            cache: Vec::new(),
+        }
+    }
+    
+    fn get(&self, line_num: usize) -> Option<&(usize, &'a str)> {
+        self.cache.get(line_num)
+    }
+
+    fn last_in_cache(&self) -> Option<(usize, usize, &'a str)> {
+        if let Some(last) = self.cache.last() {
+            Some((self.cache.len() - 1, last.0, last.1))
+        } else {
+            None
         }
     }
 }
+
 impl<'a> Iterator for LineByteCounter<'a> {
     type Item = (usize, &'a str);
 
@@ -27,7 +45,10 @@ impl<'a> Iterator for LineByteCounter<'a> {
 
         self.byte_count += line.len() + '\n'.len_utf8();
 
-        Some((byte_count, line))
+        let item = (byte_count, line);
+        self.cache.push(item);
+
+        Some(item)
     }
 }
 
@@ -37,8 +58,8 @@ pub struct Diff {
     pub source_file: String,
     pub target_file: String,
     pub source_file_path: String,
-    pub added: Vec<InputEdit>,
-    pub removed: Vec<InputEdit>,
+    pub edits: Vec<InputEdit>,
+    pub tree: Option<Tree>,
 }
 
 fn get_fs_file_path<'a>(patch_file_path: &'a str) -> &'a str {
@@ -51,10 +72,6 @@ fn get_fs_file_path<'a>(patch_file_path: &'a str) -> &'a str {
     };
 
     file
-}
-
-fn get_file_language(file_path: &str) -> Option<Language> {
-    None
 }
 
 fn try_load_file_from(file_path: &str) -> Result<String, String> {
@@ -72,8 +89,7 @@ fn try_load_file_from(file_path: &str) -> Result<String, String> {
 }
 
 impl Diff {
-
-    pub fn from_patch_file(patch_file: &PatchedFile) -> Result<Self, String> {
+    pub fn from_patch_file(patch_file: &PatchedFile, grammars: &Grammars) -> Result<Self, String> {
 
         // Load the source file from disk to get byte counts
         // And later use to parse the entire tree
@@ -86,82 +102,75 @@ impl Diff {
             Err(e) => return Err(e),
         }
 
-        let mut line_byte_counter = LineByteCounter::new(&source).peekable();
-        let mut added = Vec::new();
-        let mut removed = Vec::new();
+        let mut edits = Vec::new();
+        let mut line_byte_counter = LineByteCounter::new(&source);
 
         // TODO: Do some funky character specific diff combination instead of just line diffs? 
 
         for hunk in patch_file.hunks() {
 
-            let mut last_line_num = 0;
+            let mut last_source_context_line = hunk.source_start;
             for line in hunk.lines() {
-
                 println!("{:?}", line);
-
-                let old_line_num = line.source_line_no;
-                let new_line_num = line.target_line_no;
-
-                let line_diff = if let Some(old_line_num) = old_line_num {
-                    let next_diff = old_line_num - last_line_num;
-                    last_line_num = old_line_num;
-
-                    next_diff
-                } else {
-                    0
-                };
-
-                let current_line_counter = {
-                    let mut at_next_diff = line_byte_counter.peek().cloned();
-                    for _ in 1..line_diff {
-                        at_next_diff = line_byte_counter.next()
-                    };
-                    at_next_diff
-                };
-
-                if current_line_counter.is_none() {
-                    return Err(format!("Unable to find line byte offset for line number: {:?}", old_line_num))
-                }
-                let (start_byte, old_line) = current_line_counter.unwrap();
                 
-                // No reason to continue after this, skip
                 match line.line_type.as_str() {
-                    LINE_TYPE_ADDED | LINE_TYPE_REMOVED => (),
-                    _ => continue,
-                };
+                    LINE_TYPE_ADDED | LINE_TYPE_REMOVED => {
+                        if let Some(source_line_no) = line.source_line_no {
+                            let (start_byte, source_line_str) = if let Some(cached_line) = line_byte_counter.get(source_line_no) {
+                                *cached_line
+                            } else {
+                                let mut item = None;
+                                let iterations_to_go = if let Some(last) = line_byte_counter.last_in_cache() {
+                                    item = Some((last.1, last.2));
+                                    last_source_context_line + 1 - last.0
+                                } else {
+                                    last_source_context_line + 1
+                                };
+                                for _ in 0..iterations_to_go {
+                                    if let Some(counter) = line_byte_counter.next() {
+                                        item = Some(counter);
+                                    } else {
+                                        return Err(format!("Line counter could not iterate {}, ran out of lines", iterations_to_go))
+                                    }
+                                }
+                                if let Some(item) = item {
+                                    item
+                                } else {
+                                    return Err(format!("Unable to determine line start byte count for source line {} (L{} in diff)", source_line_no, line.diff_line_no))
+                                }
+                            };
+                            let old_end_byte = start_byte + source_line_str.len();
+                            let new_end_byte = start_byte + line.value.len();
+                            let new_end_row = if let Some(new_end_row) = line.target_line_no {
+                                new_end_row
+                            } else {
+                                // Line was removed, 
+                                assert_eq!(source_line_no - 1, last_source_context_line);
+                                source_line_no - 1
+                            };
 
-                let start_line_num = old_line_num.or_else(|| new_line_num);
-                if start_line_num.is_none() {
-                    dbg!(line);
-                    return Err(format!("Start line number could not be determined in diff line: {}", line.diff_line_no))
+                            edits.push(InputEdit { 
+                                start_byte, 
+                                old_end_byte, 
+                                new_end_byte, 
+                                start_position: Point { row: source_line_no, column: 0 }, 
+                                old_end_position: Point { row: source_line_no, column: source_line_str.chars().count() }, 
+                                new_end_position: Point { row: new_end_row, column: line.value.chars().count() } 
+                            });
+                            last_source_context_line = source_line_no;
+                        } else {
+                        }
+                    },
+                    LINE_TYPE_CONTEXT => {
+                        if let Some(source_line_no) = line.source_line_no {
+                            last_source_context_line = source_line_no;
+                        } else {
+                            return Err(format!("Context line {} in patch requires source line", line.diff_line_no));
+                        }
+                    },
+                    _ => continue,
                 }
-                let start_line_num = start_line_num.unwrap();
-                let old_line_len_bytes = old_line.len();
-                let old_line_len = old_line.chars().count();
-                let new_line_len_bytes = line.value.len();
-                let new_line_len = line.value.chars().count();
-
-                // Old line does not exist in this line, we are adding one
-                //  Also add the last line length before this one
-                let last_line_len_bytes = if old_line_num.is_none() {
-                    old_line_len_bytes
-                } else {
-                    0
-                };
-                let edit = InputEdit {
-                    start_byte,
-                    start_position: Point { row: start_line_num, column: 0 },
-                    old_end_byte: start_byte + old_line_len_bytes,
-                    old_end_position: Point { row: old_line_num.unwrap_or(last_line_num), column: old_line_len },
-                    new_end_byte: start_byte + last_line_len_bytes + new_line_len_bytes,
-                    new_end_position: Point { row: new_line_num.unwrap_or(start_line_num), column: new_line_len },
-                };
-
-                match line.line_type.as_str() {
-                    LINE_TYPE_ADDED => added.push(edit),
-                    LINE_TYPE_REMOVED => removed.push(edit),
-                    _ => continue,
-                };
+                
             }
         }
     
@@ -169,14 +178,75 @@ impl Diff {
         let target_file = patch_file.target_file.clone();
         let source_file_path = source_file_path.to_string();
 
+        let tree_path = Path::new(&source_file_path);
+        dbg!(tree_path);
+        let lang = grammars.try_get_language(tree_path).map_err(|e| e.to_string())?;
+        dbg!(lang);
+
+        let mut tree: Option<Tree> = None;
+        if let Some(lang) = lang {
+            tree = match try_parse_source_code(lang, &source) {
+                Ok(Some(tree)) => Some(tree),
+                Ok(None) => return Err(format!("Unable to parse patch file: {}", patch_file.path())),
+                Err(e) => return Err(e),
+            };
+        } else {
+            return Err(format!("Unable to determine language using tree-sitter parsers for file {}.\nCurrently configured tree-sitter paths: {:?}", 
+                tree_path.display(), grammars.get_configured_paths()));
+        }
+
         Ok(Self {
             source,
             source_file,
             source_file_path,
             target_file,
-            added,
-            removed
+            edits,
+            tree,
         })
+    }
+
+    fn dbg_print_tree(&self) {
+        fn traverse_tree_dfs<'a>(cursor: &mut TreeCursor<'a>, nodes: &mut Vec<Node<'a>>) {
+            nodes.push(cursor.node());
+
+            if cursor.goto_first_child() {
+                traverse_tree_dfs(cursor, nodes);
+            }
+
+            if cursor.goto_next_sibling() {
+                traverse_tree_dfs(cursor, nodes);
+            }
+        }
+
+        let mut tree_cursor;
+        if let Some(tree) = &self.tree {
+            tree_cursor = tree.walk()
+        } else {
+            return;
+        };
+        let mut nodes = Vec::<Node<'_>>::new();
+        traverse_tree_dfs(&mut tree_cursor, &mut nodes);
+
+        for n in nodes {
+            match n.utf8_text(self.source.as_bytes()).map_err(|e| e.to_string()) {
+                Ok(node_text) => {
+                    println!("n {}: {}", n.id(), node_text);
+                },
+                Err(e) => println!("n {}: ERR source does not match: {}", n.id(), e),
+            }
+            println!("{}", n.to_sexp());
+        }
+    }
+
+    fn try_apply_edits(&mut self) -> Result<(), String> {
+        if let Some(tree) = &mut self.tree {
+            for edit in self.edits.iter() {
+                tree.edit(edit);
+            }
+        } else {
+            return Err("No tree has been parsed yet".into())
+        }
+        Ok(())
     }
 }
 
@@ -192,26 +262,31 @@ pub fn try_parse_source_code(language: Language, source_code: &str) -> Result<Op
     Ok(tree)
 }
 
-pub fn try_parse_patch(patch: &PatchSet) -> Result<Vec<Tree>, String> {
-    let grammars = Grammars::load(Vec::new()).map_err(|e| e.to_string())?;
-    let mut trees = Vec::new();
+pub fn try_parse_patch(
+    patch: &PatchSet, 
+    parser_config_path: Option<PathBuf>, 
+    save_default_if_missing: bool, 
+    install_lang_if_missing: bool
+) -> Result<Vec<Diff>, String> {
 
+    let grammars = Grammars::load(parser_config_path, save_default_if_missing).map_err(|e| e.to_string())?;
+    if install_lang_if_missing {
+        grammars.try_install_languages()?;
+    }
+
+    let mut diffs = Vec::new();
     for patch_file in patch.files() {
-        match Diff::from_patch_file(patch_file) {
-            Ok(diff) => {
-                let source_file_path = Path::new(&diff.source_file_path);
-                if let Some(lang) = grammars.try_get_language(source_file_path).map_err(|e| e.to_string())? {
-                    dbg!(lang);
-                    match try_parse_source_code(lang, &diff.source) {
-                        Ok(Some(tree)) => trees.push(tree),
-                        Ok(None) => return Err(format!("Unable to parse patch file: {}", patch_file.path())),
-                        Err(e) => return Err(e),
-                    }
-                }
+        match Diff::from_patch_file(patch_file, &grammars) {
+            Ok(mut diff) => {
+                diff.dbg_print_tree();
+                diff.try_apply_edits()?;
+                diff.dbg_print_tree();
+
+                diffs.push(diff);
             },
             Err(e) => return Err(e),
         }
     }
 
-    Ok(trees)
+    Ok(diffs)
 }

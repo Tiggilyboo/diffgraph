@@ -1,4 +1,5 @@
 use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 use unidiff::{PatchSet, PatchedFile, LINE_TYPE_ADDED, LINE_TYPE_REMOVED, LINE_TYPE_CONTEXT };
 use tree_sitter::{Parser, Tree, Point, InputEdit, Language, TreeCursor, Node};
 
@@ -11,7 +12,6 @@ struct LineByteCounter<'a> {
     cache: Vec<(usize, &'a str)>,
 }
 
-// TODO: Use iterator (was impl but wasn't solid)
 impl<'a> LineByteCounter<'a> {
     fn new(content: &'a str) -> LineByteCounter<'a> {
         let lines = content.lines();
@@ -59,7 +59,8 @@ pub struct Diff {
     pub target_file: String,
     pub source_file_path: String,
     pub edits: Vec<InputEdit>,
-    pub tree: Option<Tree>,
+    pub tree: Tree,
+    pub language: Language,
 }
 
 fn get_fs_file_path<'a>(patch_file_path: &'a str) -> &'a str {
@@ -183,10 +184,10 @@ impl Diff {
         let lang = grammars.try_get_language(tree_path).map_err(|e| e.to_string())?;
         dbg!(lang);
 
-        let mut tree: Option<Tree> = None;
+        let tree: Tree;
         if let Some(lang) = lang {
             tree = match try_parse_source_code(lang, &source) {
-                Ok(Some(tree)) => Some(tree),
+                Ok(Some(tree)) => tree,
                 Ok(None) => return Err(format!("Unable to parse patch file: {}", patch_file.path())),
                 Err(e) => return Err(e),
             };
@@ -194,6 +195,7 @@ impl Diff {
             return Err(format!("Unable to determine language using tree-sitter parsers for file {}.\nCurrently configured tree-sitter paths: {:?}", 
                 tree_path.display(), grammars.get_configured_paths()));
         }
+        let language = tree.language();
 
         Ok(Self {
             source,
@@ -202,51 +204,28 @@ impl Diff {
             target_file,
             edits,
             tree,
+            language,
         })
     }
 
-    fn dbg_print_tree(&self) {
-        fn traverse_tree_dfs<'a>(cursor: &mut TreeCursor<'a>, nodes: &mut Vec<Node<'a>>) {
-            nodes.push(cursor.node());
-
-            if cursor.goto_first_child() {
-                traverse_tree_dfs(cursor, nodes);
-            }
-
-            if cursor.goto_next_sibling() {
-                traverse_tree_dfs(cursor, nodes);
-            }
+    fn try_apply_edits(&mut self) -> Result<Tree, String> {
+        let mut tree = self.tree.clone();
+        for edit in self.edits.iter() {
+            tree.edit(edit);
         }
-
-        let mut tree_cursor;
-        if let Some(tree) = &self.tree {
-            tree_cursor = tree.walk()
-        } else {
-            return;
-        };
-        let mut nodes = Vec::<Node<'_>>::new();
-        traverse_tree_dfs(&mut tree_cursor, &mut nodes);
-
-        for n in nodes {
-            match n.utf8_text(self.source.as_bytes()).map_err(|e| e.to_string()) {
-                Ok(node_text) => {
-                    println!("n {}: {}", n.id(), node_text);
-                },
-                Err(e) => println!("n {}: ERR source does not match: {}", n.id(), e),
-            }
-            println!("{}", n.to_sexp());
-        }
+        Ok(tree)
     }
+}
 
-    fn try_apply_edits(&mut self) -> Result<(), String> {
-        if let Some(tree) = &mut self.tree {
-            for edit in self.edits.iter() {
-                tree.edit(edit);
-            }
-        } else {
-            return Err("No tree has been parsed yet".into())
-        }
+fn export_tree_to_dot(tree: &Option<Tree>) -> Result<(), String> {
+    if let Some(tree) = tree {
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
+        let path_str = format!("./tree{}.dot", now.as_secs());
+        let file = std::fs::File::create(Path::new(&path_str)).map_err(|e| e.to_string())?;
+        tree.print_dot_graph(&file);
         Ok(())
+    } else {
+        Err("No tree has been parsed yet".into())
     }
 }
 
@@ -271,6 +250,7 @@ pub fn try_parse_patch(
 
     let grammars = Grammars::load(parser_config_path, save_default_if_missing).map_err(|e| e.to_string())?;
     if install_lang_if_missing {
+        println!("Checking missing languages...");
         grammars.try_install_languages()?;
     }
 
@@ -278,10 +258,7 @@ pub fn try_parse_patch(
     for patch_file in patch.files() {
         match Diff::from_patch_file(patch_file, &grammars) {
             Ok(mut diff) => {
-                diff.dbg_print_tree();
-                diff.try_apply_edits()?;
-                diff.dbg_print_tree();
-
+                let diff_tree = diff.try_apply_edits()?;
                 diffs.push(diff);
             },
             Err(e) => return Err(e),

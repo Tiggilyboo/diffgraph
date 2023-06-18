@@ -9,7 +9,7 @@ fn main() {
     match cli::get_params() {
         Ok(params) => {
             match DiffGraph::create(params) {
-                Ok(graph) => println!("{:#?}", graph),
+                Ok(_) => (),
                 Err(e) => println!("{}", e),
             }
         },

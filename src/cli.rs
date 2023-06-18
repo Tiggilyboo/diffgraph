@@ -244,7 +244,6 @@ pub fn get_params() -> Result<DiffGraphParams, String> {
             .long("install-missing")
             .action(ArgAction::SetTrue)
             .help("Install missing tree-sitter parsers automatically"))
-            
         .get_matches();
 
     let clone_path = matches.get_one::<String>("clone");

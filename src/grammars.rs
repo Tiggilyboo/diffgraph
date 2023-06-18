@@ -284,10 +284,11 @@ impl Grammars {
                 Err(format!("Unable to execute git clone command: {}", stdout))
             }
         }
+
         for parser_url in self.parser_config.parsers.iter() {
             let repo_path = try_get_parser_repo_path(parser_url)?;
-            dbg!(&repo_path);
             if !repo_path.exists() {
+                println!("Cloning missing language: {}", parser_url);
                 clone_repo_in_dir(&parser_url, &repo_path)?;
             }
         }

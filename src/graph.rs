@@ -3,7 +3,6 @@ use petgraph::graphmap::DiGraphMap;
 use unidiff::PatchSet;
 use tree_sitter::{Tree, TreeCursor};
 use tree_sitter::Node as TSNode;
-use std::collections::HashMap;
 
 type NodeWeight = usize;
 
@@ -110,7 +109,6 @@ where F: FnMut(TSNode, TSNode)
 }
 
 impl DiffGraph {
-
     pub fn create(params: DiffGraphParams) -> Result<Self, String> {
         let diffs = match try_parse_patch(
             &params.diff, 
@@ -130,7 +128,7 @@ impl DiffGraph {
         })
     }
 
-    pub fn create_graph_from_diffs(diffs: &Vec<Diff>) -> Result<DiGraphMap<NodeWeight, Edge>, String> {
+    fn create_graph_from_diffs(diffs: &Vec<Diff>) -> Result<DiGraphMap<NodeWeight, Edge>, String> {
         let mut graph = DiGraphMap::new();
         for d in diffs {
             let mut dfs = TreeIterator::new(&d.tree, |from, to| {
@@ -140,13 +138,8 @@ impl DiffGraph {
 
                 graph.add_edge(from_node_id, to_node_id, edge);
             });
-
-            let mut c = 0;
-            while dfs.next().is_some() {
-                c += 1;
-            }
-
-            println!("Processed {} nodes in dfs.", c);
+            while dfs.next().is_some() {}
+            dfs.reset();
         }
 
         Ok(graph)

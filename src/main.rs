@@ -12,6 +12,7 @@ fn main() {
                 Ok(_) => (),
                 Err(e) => println!("{}", e),
             }
+
         },
         Err(e) => println!("{}", e),
     }

@@ -1,7 +1,7 @@
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 use unidiff::{PatchSet, PatchedFile, LINE_TYPE_ADDED, LINE_TYPE_REMOVED, LINE_TYPE_CONTEXT };
-use tree_sitter::{Parser, Tree, Point, InputEdit, Language, TreeCursor, Node};
+use tree_sitter::{Parser, Tree, Point, InputEdit, Language};
 
 use crate::grammars::Grammars;
 
@@ -258,7 +258,7 @@ pub fn try_parse_patch(
     for patch_file in patch.files() {
         match Diff::from_patch_file(patch_file, &grammars) {
             Ok(mut diff) => {
-                let diff_tree = diff.try_apply_edits()?;
+                let _diff_tree = diff.try_apply_edits()?;
                 diffs.push(diff);
             },
             Err(e) => return Err(e),
